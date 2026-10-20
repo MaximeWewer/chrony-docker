@@ -27,7 +27,7 @@ docker run -d --name chrony --restart unless-stopped \
 
 - `--sysctl net.ipv4.ip_unprivileged_port_start=123` lets uid 65532 bind port 123 without `CAP_NET_BIND_SERVICE`. You can also keep the default and publish a high port instead: `-e NTP_PORT=1123 -p 123:1123/udp`.
 - The state volume (or a `--tmpfs /run/chrony:uid=65532,gid=65532`) is the only writable path. Mount it on `/run/chrony`, not on the state directory itself: the entrypoint creates `/run/chrony/state` and locks it down to `0700`, as chronyd requires for its command socket. A world-writable volume such as a Kubernetes `emptyDir` is therefore fine.
-- State lives under `/run/chrony`, the only path that the Debian/Ubuntu AppArmor profile for `/usr/sbin/chronyd` allows at every depth. That profile is matched by path, so it also applies to unconfined containers on those hosts. For the same reason, mount certificates and other files under `/etc/chrony/`.
+- chronyd is installed as `/usr/local/sbin/chronyd`, not `/usr/sbin/chronyd`. Debian and Ubuntu hosts ship an AppArmor profile attached to `/usr/sbin/chronyd`. Because it is matched by path, it would also confine the container's chronyd and drop the signals sent by the runtime: no clean shutdown, lost state, exit code 137. Confining the container with the runtime's own profile (`RuntimeDefault` in Kubernetes) is still recommended.
 - Run as `65532:65532` (the image default): chronyd checks that its socket directory belongs to that user.
 - Without `ALLOW`, the server answers localhost only.
 

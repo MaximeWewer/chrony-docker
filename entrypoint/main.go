@@ -25,15 +25,16 @@ import (
 )
 
 const (
-	// Under /run/chrony so that the host's AppArmor profile for
-	// /usr/sbin/chronyd (Debian/Ubuntu), which also applies to unconfined
-	// containers by path, allows it: "@{run}/chrony/{,**} rw" covers every
-	// level, whereas "/var/lib/chrony/{,*} rw" covers a single one.
+	// Under /run/chrony, where chrony keeps its runtime files on Debian-like
+	// systems, so that it is also allowed by their AppArmor profile should a
+	// host ever apply it.
 	stateDir = "/run/chrony/state"
 	// chronyd compares the owner of the command socket directory with this
 	// user (its compiled-in default user, "nonroot" in distroless).
 	chronyUID, chronyGID = 65532, 65532
-	chronydPath          = "/usr/sbin/chronyd"
+	// Not /usr/sbin/chronyd: the host's AppArmor profile for that path would
+	// apply to this unconfined container process and block runc's signals.
+	chronydPath = "/usr/local/sbin/chronyd"
 )
 
 var version = "dev"

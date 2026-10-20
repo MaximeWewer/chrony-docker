@@ -80,6 +80,7 @@ RUN PKG_CONFIG=/usr/local/bin/pkg-config-static \
     LDFLAGS="-static-pie -Wl,-z,relro,-z,now,-z,noexecstack" \
     ./configure \
         --prefix=/usr \
+        --sbindir=/usr/local/sbin \
         --sysconfdir=/etc/chrony \
         --with-user=nonroot \
         --with-pidfile=/run/chrony/state/chronyd.pid \
@@ -89,19 +90,19 @@ RUN PKG_CONFIG=/usr/local/bin/pkg-config-static \
         --disable-rtc --without-nss --without-tomcrypt \
  && make -j"$(nproc)" \
  && make install DESTDIR=/out \
- && strip /out/usr/sbin/chronyd /out/usr/bin/chronyc
+ && strip /out/usr/local/sbin/chronyd /out/usr/bin/chronyc
 
 # Fail the build rather than ship an image that silently lost NTS, the seccomp
 # filter, privilege dropping, or that turned out not to be static.
 RUN set -eux; \
-    /out/usr/sbin/chronyd -v; \
-    /out/usr/sbin/chronyd -v | grep -q -- '+NTS'; \
-    /out/usr/sbin/chronyd -v | grep -q -- '+SCFILTER'; \
-    /out/usr/sbin/chronyd -v | grep -q -- '+PRIVDROP'; \
-    /out/usr/sbin/chronyd -v | grep -q -- '+SECHASH'; \
-    ! readelf -lW /out/usr/sbin/chronyd | grep -q INTERP; \
+    /out/usr/local/sbin/chronyd -v; \
+    /out/usr/local/sbin/chronyd -v | grep -q -- '+NTS'; \
+    /out/usr/local/sbin/chronyd -v | grep -q -- '+SCFILTER'; \
+    /out/usr/local/sbin/chronyd -v | grep -q -- '+PRIVDROP'; \
+    /out/usr/local/sbin/chronyd -v | grep -q -- '+SECHASH'; \
+    ! readelf -lW /out/usr/local/sbin/chronyd | grep -q INTERP; \
     ! readelf -lW /out/usr/bin/chronyc | grep -q INTERP; \
-    readelf -hW /out/usr/sbin/chronyd | grep -q 'DYN (Position-Independent'
+    readelf -hW /out/usr/local/sbin/chronyd | grep -q 'DYN (Position-Independent'
 
 # Empty, correctly owned state directory for the final image, plus the leap
 # second table so a stratum-1 or orphaned server announces leap seconds.
@@ -138,7 +139,12 @@ LABEL org.opencontainers.image.title="chrony" \
       org.opencontainers.image.licenses="MIT" \
       org.opencontainers.image.source="https://github.com/MaximeWewer/chrony-docker"
 
-COPY --from=chrony /out/usr/sbin/chronyd /usr/sbin/chronyd
+# Deliberately not /usr/sbin/chronyd. Debian/Ubuntu hosts ship an AppArmor
+# profile attached to that path, which also confines unconfined container
+# processes executing it. That profile has no signal rules, so it drops the
+# SIGTERM/SIGKILL sent by runc: chronyd never shuts down cleanly, loses its
+# state, and is killed after the grace period (exit 137).
+COPY --from=chrony /out/usr/local/sbin/chronyd /usr/local/sbin/chronyd
 COPY --from=chrony /out/usr/bin/chronyc  /usr/bin/chronyc
 COPY --from=chrony /files/ /
 COPY --from=entrypoint /chrony-entrypoint /chrony-entrypoint
