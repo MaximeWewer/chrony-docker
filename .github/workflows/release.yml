@@ -3,7 +3,12 @@ name: release
 # Manually triggered. Computes a CalVer YYYY.M.X version (or uses force_version),
 # builds the image natively on amd64 and arm64 runners (GnuTLS and chrony are
 # compiled from source, far too slow under QEMU), pushes a multi-arch index to
-# GHCR, signs it, and publishes a GitHub Release that creates the v<version> tag.
+# GHCR tagged <version> and latest, attests it, and publishes a GitHub Release
+# that creates the v<version> tag.
+#
+# The registry only holds the index and its two platform images. Provenance
+# and SBOM are GitHub artifact attestations (Sigstore-signed, stored by GitHub,
+# checked with "gh attestation verify") rather than extra manifests in GHCR.
 on:
   workflow_dispatch:
     inputs:
@@ -88,8 +93,10 @@ jobs:
           labels: |
             org.opencontainers.image.revision=${{ github.sha }}
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
-          provenance: mode=max
-          sbom: true
+          # No in-registry attestations: they add an index and an
+          # "unknown/unknown" manifest per platform. See the publish job.
+          provenance: false
+          sbom: false
           cache-from: type=gha,scope=${{ matrix.platform }}
           cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
 
@@ -105,7 +112,7 @@ jobs:
             grep -q -- "$f" version.txt || { echo "::error::chronyd lost $f"; exit 1; }
           done
           docker run --rm --read-only --cap-drop ALL \
-            --tmpfs /var/lib/chrony:uid=65532,gid=65532,mode=0700 \
+            --tmpfs /run/chrony:uid=65532,gid=65532 \
             -e NTP_POOLS=pool.ntp.org -e NTS=true -e ALLOW=10.0.0.0/8,fd00::/8 "$REF" config
 
       - name: Export digest
@@ -126,8 +133,9 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write
-      id-token: write # keyless cosign signature
+      packages: write # push the index, delete orphaned versions
+      id-token: write # Sigstore signing of the attestations
+      attestations: write
     outputs:
       digest: ${{ steps.index.outputs.digest }}
     steps:
@@ -151,19 +159,48 @@ jobs:
           V: ${{ needs.prepare.outputs.version }}
         run: |
           set -euo pipefail
-          MINOR="${V%.*}"
           # shellcheck disable=SC2046
           docker buildx imagetools create \
-            -t "$IMAGE:$V" -t "$IMAGE:$MINOR" -t "$IMAGE:latest" \
+            -t "$IMAGE:$V" -t "$IMAGE:latest" \
             $(cd digests && printf "$IMAGE@sha256:%s " *)
           docker buildx imagetools inspect "$IMAGE:$V"
           DIGEST=$(docker buildx imagetools inspect "$IMAGE:$V" --format '{{json .Manifest}}' | jq -r .digest)
           echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
 
-      - uses: sigstore/cosign-installer@v4.1.2 # no floating v4 tag upstream
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0.24.3 # floating v0 tag lags behind upstream
+        with:
+          image: ${{ env.IMAGE }}@${{ steps.index.outputs.digest }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+          upload-artifact: false
 
-      - name: Sign
-        run: cosign sign --yes "$IMAGE@${{ steps.index.outputs.digest }}"
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.index.outputs.digest }}
+
+      - name: Attest SBOM
+        uses: actions/attest-sbom@v4
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.index.outputs.digest }}
+          sbom-path: sbom.spdx.json
+
+      # Remove what no tag references any more: digests pushed by failed or
+      # retried runs, and leftovers of older releases. Platform images that a
+      # tagged index still references are kept.
+      - name: Delete orphaned versions
+        uses: dataaxiom/ghcr-cleanup-action@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          package: chrony-docker
+          delete-untagged: true
+          delete-orphaned-images: true
+          delete-ghost-images: true
+          delete-partial-images: true
+          validate: true
 
   release:
     needs: [prepare, publish]
@@ -196,12 +233,12 @@ jobs:
             echo "docker pull ${IMAGE}@${DIGEST}"
             echo '```'
             echo
-            echo "Verify the signature:"
+            echo "Verify the provenance and the SBOM attestations:"
             echo
             echo '```'
-            echo "cosign verify ${IMAGE}@${DIGEST} \\"
-            echo "  --certificate-identity-regexp '^https://github.com/${REPO}/' \\"
-            echo "  --certificate-oidc-issuer https://token.actions.githubusercontent.com"
+            echo "gh attestation verify oci://${IMAGE}@${DIGEST} --repo ${REPO}"
+            echo "gh attestation verify oci://${IMAGE}@${DIGEST} --repo ${REPO} \\"
+            echo "  --predicate-type https://spdx.dev/Document/v2.3"
             echo '```'
             echo
             echo "### Changes"

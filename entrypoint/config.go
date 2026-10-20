@@ -159,7 +159,10 @@ func render(c *Config) (string, error) {
 	p("driftfile %s/drift", c.StateDir)
 	p("dumpdir %s", c.StateDir)
 	p("ntsdumpdir %s", c.StateDir)
-	p("pidfile %s/chronyd.pid", c.StateDir)
+	// chronyd is PID 1 in its own PID namespace, so a pidfile cannot detect
+	// anything, and a stale one left on a persistent volume holds "1", which is
+	// chronyd's own PID after a restart: it would refuse to start. Disable it.
+	p("pidfile /")
 	// Command and monitoring access over a Unix socket only; the UDP command
 	// port is disabled, which removes the remote monitoring attack surface.
 	p("bindcmdaddress %s/chronyd.sock", c.StateDir)

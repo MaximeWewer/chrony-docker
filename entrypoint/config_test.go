@@ -7,7 +7,7 @@ import (
 
 func baseConfig() *Config {
 	return &Config{
-		StateDir:      "/var/lib/chrony",
+		StateDir:      "/run/chrony/state",
 		SourceOptions: "iburst",
 		NTPPort:       "123",
 		NTSPort:       "4460",
@@ -99,5 +99,12 @@ func TestListKeepsPerSourceOptions(t *testing.T) {
 	got := list("NTP_SERVERS")
 	if len(got) != 3 || got[1] != "b.example iburst prefer" {
 		t.Fatalf("got %q", got)
+	}
+}
+
+func TestPidfileDisabled(t *testing.T) {
+	out := mustRender(t, baseConfig())
+	if !strings.Contains(out, "pidfile /\n") || strings.Contains(out, ".pid") {
+		t.Fatalf("pidfile must be disabled (stale PID 1 blocks restarts):\n%s", out)
 	}
 }

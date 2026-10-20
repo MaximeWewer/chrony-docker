@@ -1,6 +1,6 @@
 # Hardened chrony NTP/NTS server.
 #   docker compose up -d
-#   docker compose exec chrony /usr/bin/chronyc -h /var/lib/chrony/chronyd.sock -N sources
+#   docker compose exec chrony /usr/bin/chronyc -N sources
 services:
   chrony:
     image: ghcr.io/maximewewer/chrony-docker:latest # pin a version or a digest in production
@@ -23,7 +23,7 @@ services:
       ALLOW: "192.168.0.0/16,10.0.0.0/8,fd00::/8"
     volumes:
       # State (drift, NTS cookies, sample history): keeps restarts fast.
-      - chrony-state:/var/lib/chrony
+      - chrony-state:/run/chrony
       # NTS server: uncomment and provide a certificate readable by uid 65532.
       # - ./nts/tls.crt:/etc/chrony/nts/tls.crt:ro
       # - ./nts/tls.key:/etc/chrony/nts/tls.key:ro

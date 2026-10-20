@@ -1,6 +1,6 @@
 // chrony-entrypoint is a tiny PID 1 for a distroless chrony image.
 //
-// It renders /var/lib/chrony/chrony.conf from the environment (or uses a
+// It renders /run/chrony/state/chrony.conf from the environment (or uses a
 // mounted configuration as-is), seeds the NTS server keys when they are
 // provided by a Secret, and then exec()s chronyd so that chronyd itself is
 // PID 1 and receives SIGTERM directly.
@@ -25,8 +25,15 @@ import (
 )
 
 const (
-	stateDir    = "/var/lib/chrony"
-	chronydPath = "/usr/sbin/chronyd"
+	// Under /run/chrony so that the host's AppArmor profile for
+	// /usr/sbin/chronyd (Debian/Ubuntu), which also applies to unconfined
+	// containers by path, allows it: "@{run}/chrony/{,**} rw" covers every
+	// level, whereas "/var/lib/chrony/{,*} rw" covers a single one.
+	stateDir = "/run/chrony/state"
+	// chronyd compares the owner of the command socket directory with this
+	// user (its compiled-in default user, "nonroot" in distroless).
+	chronyUID, chronyGID = 65532, 65532
+	chronydPath          = "/usr/sbin/chronyd"
 )
 
 var version = "dev"
@@ -131,6 +138,18 @@ func prepareState(cfg *Config) error {
 			return fmt.Errorf("state directory %s: %w (started as root without CAP_DAC_OVERRIDE: run as uid 65532 instead)", cfg.StateDir, err)
 		}
 		return fmt.Errorf("state directory %s: %w", cfg.StateDir, err)
+	}
+	if os.Geteuid() != 0 {
+		if err := secureStateDir(cfg.StateDir); err != nil {
+			return err
+		}
+	}
+
+	// A mounted CHRONY_CONF may rely on the compiled-in pidfile. It can only
+	// ever be stale (chronyd is PID 1 here) and would make chronyd refuse to
+	// start, so remove it.
+	if err := os.Remove(filepath.Join(cfg.StateDir, "chronyd.pid")); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("removing stale pidfile: %w", err)
 	}
 
 	if cfg.NTSKeysFile == "" {
@@ -250,4 +269,27 @@ func hasCapability(bit uint) bool {
 		}
 	}
 	return false
+}
+
+// secureStateDir gives the state directory the permissions chronyd demands
+// for its command socket: no access for others, owned by its user and group.
+// A volume such as a Kubernetes emptyDir is world-writable (0777); chronyd
+// would then log "Wrong permissions" and silently disable the socket, leaving
+// chronyc and any exporter blind. Mount the volume on the parent directory
+// and let this function lock down the subdirectory.
+func secureStateDir(dir string) error {
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return fmt.Errorf("state directory %s: chmod 0700: %w", dir, err)
+	}
+	// With fsGroup the directory inherits another group through the setgid
+	// bit of the volume; take our own group back (we are a member of both).
+	if err := os.Chown(dir, -1, os.Getegid()); err != nil {
+		return fmt.Errorf("state directory %s: chgrp %d: %w", dir, os.Getegid(), err)
+	}
+	if os.Geteuid() != chronyUID || os.Getegid() != chronyGID {
+		warn("running as %d:%d, not %d:%d: chronyd will refuse its command socket "+
+			"(chronyc, exporters and the client-only readiness check will not work)",
+			os.Geteuid(), os.Getegid(), chronyUID, chronyGID)
+	}
+	return nil
 }

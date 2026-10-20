@@ -17,7 +17,7 @@ For Kubernetes, use the Helm chart: **[MaximeWewer/chrony-helm](https://github.c
 docker run -d --name chrony --restart unless-stopped \
   --read-only --cap-drop ALL --security-opt no-new-privileges \
   --sysctl net.ipv4.ip_unprivileged_port_start=123 \
-  -v chrony-state:/var/lib/chrony \
+  -v chrony-state:/run/chrony \
   -p 123:123/udp -p 4460:4460/tcp \
   -e NTP_SERVERS=time.cloudflare.com,nts.netnod.se,ptbtime1.ptb.de \
   -e NTS=true -e MINSOURCES=2 \
@@ -26,7 +26,9 @@ docker run -d --name chrony --restart unless-stopped \
 ```
 
 - `--sysctl net.ipv4.ip_unprivileged_port_start=123` lets uid 65532 bind port 123 without `CAP_NET_BIND_SERVICE`. You can also keep the default and publish a high port instead: `-e NTP_PORT=1123 -p 123:1123/udp`.
-- The state volume (or a `--tmpfs /var/lib/chrony:uid=65532,gid=65532,mode=0700`) is the only writable path.
+- The state volume (or a `--tmpfs /run/chrony:uid=65532,gid=65532`) is the only writable path. Mount it on `/run/chrony`, not on the state directory itself: the entrypoint creates `/run/chrony/state` and locks it down to `0700`, as chronyd requires for its command socket. A world-writable volume such as a Kubernetes `emptyDir` is therefore fine.
+- State lives under `/run/chrony`, the only path that the Debian/Ubuntu AppArmor profile for `/usr/sbin/chronyd` allows at every depth. That profile is matched by path, so it also applies to unconfined containers on those hosts. For the same reason, mount certificates and other files under `/etc/chrony/`.
+- Run as `65532:65532` (the image default): chronyd checks that its socket directory belongs to that user.
 - Without `ALLOW`, the server answers localhost only.
 
 ## Docker Compose
@@ -35,7 +37,7 @@ See [`compose.yaml`](compose.yaml):
 
 ```bash
 docker compose up -d
-docker compose exec chrony /usr/bin/chronyc -h /var/lib/chrony/chronyd.sock -N sources
+docker compose exec chrony /usr/bin/chronyc -N sources
 ```
 
 ## Operations
@@ -47,9 +49,9 @@ docker run --rm ghcr.io/maximewewer/chrony-docker config   # render, validate wi
 docker exec chrony /chrony-entrypoint version
 docker exec chrony /chrony-entrypoint health                # liveness
 docker exec chrony /chrony-entrypoint ready                 # readiness
-docker exec chrony /usr/bin/chronyc -h /var/lib/chrony/chronyd.sock tracking
-docker exec chrony /usr/bin/chronyc -h /var/lib/chrony/chronyd.sock -N authdata
-docker exec chrony /usr/bin/chronyc -h /var/lib/chrony/chronyd.sock reload sources
+docker exec chrony /usr/bin/chronyc tracking
+docker exec chrony /usr/bin/chronyc -N authdata
+docker exec chrony /usr/bin/chronyc reload sources
 ```
 
 - **`health`** checks only that chronyd has bound its port. It does **not** require synchronisation: chronyd does not answer clients until it is synchronised, and a strict liveness check would restart every instance during an upstream outage. It is the image's Docker `HEALTHCHECK`.
@@ -71,11 +73,11 @@ NTS is enabled as soon as both files are present. Clients then use `server <name
 ```bash
 # 1. Generate an ntskeys file in chrony's format
 docker volume create nts-seed
-docker run -d --name seed -v nts-seed:/var/lib/chrony \
+docker run -d --name seed -v nts-seed:/run/chrony \
   -v "$PWD/tls.crt:/etc/chrony/nts/tls.crt:ro" -v "$PWD/tls.key:/etc/chrony/nts/tls.key:ro" \
   --sysctl net.ipv4.ip_unprivileged_port_start=123 ghcr.io/maximewewer/chrony-docker
 sleep 3 && docker stop seed
-docker run --rm -v nts-seed:/v alpine:3.24 cat /v/ntskeys > ntskeys
+docker run --rm -v nts-seed:/v alpine:3.24 cat /v/state/ntskeys > ntskeys
 docker rm seed && docker volume rm nts-seed
 
 # 2. Mount it read-only in every instance
@@ -110,7 +112,7 @@ Lists accept commas or newlines as separators. A source entry that contains spac
 | `NTP_SERVERS` / `NTP_POOLS` / `NTP_PEERS`                  | —                             | `server` / `pool` / `peer`                                                            |
 | `SOURCE_OPTIONS`                                           | `iburst minpoll 6 maxpoll 10` | options added to entries that have none                                               |
 | `NTS`                                                      | `false`                       | adds `nts` to every source. When all sources use NTS, `authselectmode require` is set |
-| `NTS_TRUSTED_CERTS`                                        | —                             | `ntstrustedcerts` (private CA)                                                        |
+| `NTS_TRUSTED_CERTS`                                        | —                             | `ntstrustedcerts` (private CA, keep it under `/etc/chrony/`)                          |
 | `REFCLOCKS`                                                | —                             | `refclock` lines (PHC/PPS)                                                            |
 | `MINSOURCES`, `MAXDISTANCE`, `MAXJITTER`, `AUTHSELECTMODE` | —                             | source selection                                                                      |
 | `LOCAL_STRATUM`, `LOCAL_ORPHAN`, `LOCAL_DISTANCE`          | —                             | `local stratum N [orphan] [distance D]`                                               |
@@ -143,6 +145,7 @@ Lists accept commas or newlines as separators. A source entry that contains spac
 
 | Variable                                              | Default                           | Effect                                                                             |
 | ----------------------------------------------------- | --------------------------------- | ---------------------------------------------------------------------------------- |
+| `CHRONY_STATE_DIR`                                    | `/run/chrony/state`               | writable state: config, drift, NTS keys, command socket. Must not be a mount point |
 | `CHRONY_CONF`                                         | —                                 | full mounted config, used as-is (the environment is ignored)                       |
 | `CHRONY_CONF_DIR`                                     | `/etc/chrony/conf.d`              | `confdir` if it exists (`*.conf` files)                                            |
 | `CHRONY_SOURCE_DIR`                                   | `/etc/chrony/sources.d`           | `sourcedir` if it exists (`*.sources` files, reloaded by `chronyc reload sources`) |

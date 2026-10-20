@@ -82,7 +82,8 @@ RUN PKG_CONFIG=/usr/local/bin/pkg-config-static \
         --prefix=/usr \
         --sysconfdir=/etc/chrony \
         --with-user=nonroot \
-        --with-pidfile=/var/lib/chrony/chronyd.pid \
+        --with-pidfile=/run/chrony/state/chronyd.pid \
+        --chronyrundir=/run/chrony/state \
         --enable-scfilter \
         --disable-readline --without-editline \
         --disable-rtc --without-nss --without-tomcrypt \
@@ -104,8 +105,8 @@ RUN set -eux; \
 
 # Empty, correctly owned state directory for the final image, plus the leap
 # second table so a stratum-1 or orphaned server announces leap seconds.
-RUN install -d -m 0700 -o 65532 -g 65532 /state \
- && install -m 0600 -o 65532 -g 65532 /dev/null /state/.keep \
+RUN install -d -m 0750 -o 65532 -g 65532 /files/run/chrony \
+ && install -d -m 0700 -o 65532 -g 65532 /files/run/chrony/state \
  && install -D -m 0644 /usr/share/zoneinfo/leap-seconds.list /files/usr/share/zoneinfo/leap-seconds.list
 
 # ---------------------------------------------------------------------------
@@ -140,11 +141,10 @@ LABEL org.opencontainers.image.title="chrony" \
 COPY --from=chrony /out/usr/sbin/chronyd /usr/sbin/chronyd
 COPY --from=chrony /out/usr/bin/chronyc  /usr/bin/chronyc
 COPY --from=chrony /files/ /
-COPY --from=chrony --chown=65532:65532 /state/ /var/lib/chrony/
 COPY --from=entrypoint /chrony-entrypoint /chrony-entrypoint
 
 ENV CHRONY_VERSION=${CHRONY_VERSION} \
-    CHRONY_STATE_DIR=/var/lib/chrony \
+    CHRONY_STATE_DIR=/run/chrony/state \
     NTP_PORT=123 \
     NTS_PORT=4460 \
     SOURCE_OPTIONS="iburst minpoll 6 maxpoll 10" \
@@ -152,8 +152,11 @@ ENV CHRONY_VERSION=${CHRONY_VERSION} \
     CLOCK_CONTROL=false
 
 USER 65532:65532
-WORKDIR /var/lib/chrony
-VOLUME ["/var/lib/chrony"]
+# Not the state directory: if it is missing on a freshly mounted volume, the
+# runtime would create the working directory as root before the entrypoint
+# runs, and the non-root entrypoint could neither write to it nor fix it.
+WORKDIR /
+VOLUME ["/run/chrony"]
 EXPOSE 123/udp 4460/tcp
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
