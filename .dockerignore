@@ -1,0 +1,3 @@
+*
+!entrypoint/*.go
+!entrypoint/go.mod

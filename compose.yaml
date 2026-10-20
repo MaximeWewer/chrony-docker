@@ -1,0 +1,35 @@
+# Hardened chrony NTP/NTS server.
+#   docker compose up -d
+#   docker compose exec chrony /usr/bin/chronyc -h /var/lib/chrony/chronyd.sock -N sources
+services:
+  chrony:
+    image: ghcr.io/maximewewer/chrony-docker:latest # pin a version or a digest in production
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    # Lets the non-root user bind port 123 without any capability.
+    sysctls:
+      net.ipv4.ip_unprivileged_port_start: "123"
+    ports:
+      - "123:123/udp"
+      - "4460:4460/tcp" # NTS-KE, only used when a certificate is mounted
+    environment:
+      NTP_SERVERS: "time.cloudflare.com,nts.netnod.se,ptbtime1.ptb.de"
+      NTS: "true"
+      MINSOURCES: "2"
+      # Who may query this server (IPv4 and IPv6). Empty = localhost only.
+      ALLOW: "192.168.0.0/16,10.0.0.0/8,fd00::/8"
+    volumes:
+      # State (drift, NTS cookies, sample history): keeps restarts fast.
+      - chrony-state:/var/lib/chrony
+      # NTS server: uncomment and provide a certificate readable by uid 65532.
+      # - ./nts/tls.crt:/etc/chrony/nts/tls.crt:ro
+      # - ./nts/tls.key:/etc/chrony/nts/tls.key:ro
+      # Optional drop-ins and reloadable sources:
+      # - ./conf.d:/etc/chrony/conf.d:ro
+      # - ./sources.d:/etc/chrony/sources.d:ro
+
+volumes:
+  chrony-state:

@@ -1,0 +1,224 @@
+name: release
+
+# Manually triggered. Computes a CalVer YYYY.M.X version (or uses force_version),
+# builds the image natively on amd64 and arm64 runners (GnuTLS and chrony are
+# compiled from source, far too slow under QEMU), pushes a multi-arch index to
+# GHCR, signs it, and publishes a GitHub Release that creates the v<version> tag.
+on:
+  workflow_dispatch:
+    inputs:
+      force_version:
+        description: "Override version (format YYYY.M.X, no leading v). Empty = auto-increment."
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: ghcr.io/maximewewer/chrony-docker
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      chrony: ${{ steps.version.outputs.chrony }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # need tags + history
+
+      - name: Compute version
+        id: version
+        run: |
+          set -euo pipefail
+          FORCE="${{ inputs.force_version }}"
+          if [ -n "$FORCE" ]; then
+            echo "$FORCE" | grep -qE '^[0-9]{4}\.[0-9]{1,2}\.[0-9]+$' \
+              || { echo "::error::force_version must be YYYY.M.X"; exit 1; }
+            V="$FORCE"
+          else
+            YEAR=$(date -u +%Y)
+            MONTH=$(date -u +%-m) # no leading zero
+            PREFIX="v${YEAR}.${MONTH}."
+            LAST=$(git tag -l "${PREFIX}*" | sed "s|^${PREFIX}||" | sort -n | tail -1)
+            if [ -z "$LAST" ]; then PATCH=1; else PATCH=$((LAST + 1)); fi
+            V="${YEAR}.${MONTH}.${PATCH}"
+          fi
+          git rev-parse -q --verify "refs/tags/v$V" >/dev/null \
+            && { echo "::error::tag v$V already exists"; exit 1; }
+          CHRONY=$(sed -n 's/^ARG CHRONY_VERSION=//p' Dockerfile | head -1)
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "chrony=$CHRONY" >> "$GITHUB_OUTPUT"
+          echo "Version: v$V (chrony $CHRONY)"
+
+  build:
+    name: build ${{ matrix.platform }}
+    needs: prepare
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { platform: linux/amd64, runner: ubuntu-latest }
+          - { platform: linux/arm64, runner: ubuntu-24.04-arm }
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            VERSION=${{ needs.prepare.outputs.version }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          provenance: mode=max
+          sbom: true
+          cache-from: type=gha,scope=${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
+
+      # The image has no shell: exercise the entrypoint itself on the pushed
+      # digest, on the architecture it was built for.
+      - name: Smoke test
+        env:
+          REF: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          docker run --rm "$REF" version | tee version.txt
+          for f in +NTS +SCFILTER +PRIVDROP +SECHASH +IPV6; do
+            grep -q -- "$f" version.txt || { echo "::error::chronyd lost $f"; exit 1; }
+          done
+          docker run --rm --read-only --cap-drop ALL \
+            --tmpfs /var/lib/chrony:uid=65532,gid=65532,mode=0700 \
+            -e NTP_POOLS=pool.ntp.org -e NTS=true -e ALLOW=10.0.0.0/8,fd00::/8 "$REF" config
+
+      - name: Export digest
+        run: |
+          mkdir -p digests
+          touch "digests/${DIGEST#sha256:}"
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: digest-${{ strategy.job-index }}
+          path: digests/*
+          retention-days: 1
+
+  publish:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write # keyless cosign signature
+    outputs:
+      digest: ${{ steps.index.outputs.digest }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create multi-arch index
+        id: index
+        env:
+          V: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          MINOR="${V%.*}"
+          # shellcheck disable=SC2046
+          docker buildx imagetools create \
+            -t "$IMAGE:$V" -t "$IMAGE:$MINOR" -t "$IMAGE:latest" \
+            $(cd digests && printf "$IMAGE@sha256:%s " *)
+          docker buildx imagetools inspect "$IMAGE:$V"
+          DIGEST=$(docker buildx imagetools inspect "$IMAGE:$V" --format '{{json .Manifest}}' | jq -r .digest)
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+
+      - uses: sigstore/cosign-installer@v4.1.2 # no floating v4 tag upstream
+
+      - name: Sign
+        run: cosign sign --yes "$IMAGE@${{ steps.index.outputs.digest }}"
+
+  release:
+    needs: [prepare, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the tag + release
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Release notes
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          CHRONY: ${{ needs.prepare.outputs.chrony }}
+          DIGEST: ${{ needs.publish.outputs.digest }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # The v$VERSION tag is created by the publish step below, so the latest
+          # existing tag here is the PREVIOUS release. List only the commits added
+          # since it (PREV..HEAD), not a fixed window of history.
+          PREV=$(git tag -l 'v*' | sort -V | tail -1 || true)
+          if [ -n "$PREV" ]; then RANGE="${PREV}..HEAD"; else RANGE=""; fi
+          {
+            echo "chrony ${CHRONY}, distroless, non-root, NTS. linux/amd64 + linux/arm64."
+            echo
+            echo '```'
+            echo "docker pull ${IMAGE}:${VERSION}"
+            echo "docker pull ${IMAGE}@${DIGEST}"
+            echo '```'
+            echo
+            echo "Verify the signature:"
+            echo
+            echo '```'
+            echo "cosign verify ${IMAGE}@${DIGEST} \\"
+            echo "  --certificate-identity-regexp '^https://github.com/${REPO}/' \\"
+            echo "  --certificate-oidc-issuer https://token.actions.githubusercontent.com"
+            echo '```'
+            echo
+            echo "### Changes"
+            # shellcheck disable=SC2086
+            git log $RANGE --no-merges --pretty='- %s (%h)' || true
+            echo
+            if [ -n "$PREV" ]; then
+              echo "**Full diff:** https://github.com/${REPO}/compare/${PREV}...v${VERSION}"
+            fi
+          } > notes.md
+          cat notes.md
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: v${{ needs.prepare.outputs.version }}
+          name: Release ${{ needs.prepare.outputs.version }}
+          body_path: notes.md
+          draft: false
+          prerelease: false
